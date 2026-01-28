@@ -13,7 +13,6 @@ import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
-import os
 import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -21,11 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-except:
-    pass
+from gsplat.strategy import DefaultStrategy
 
 class GaussianModel:
 
@@ -61,11 +56,32 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.optimizers = {}
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.strategy = None
+        self.strategy_state = None
         self.setup_functions()
 
+    def _sync_splats(self):
+        self.splats = nn.ParameterDict(
+            {
+                "means": self._xyz,
+                "sh0": self._features_dc,
+                "shN": self._features_rest,
+                "scales": self._scaling,
+                "quats": self._rotation,
+                "opacities": self._opacity,
+            }
+        )
+
     def capture(self):
+        if self.optimizers:
+            opt_state = {name: opt.state_dict() for name, opt in self.optimizers.items()}
+        elif self.optimizer is not None:
+            opt_state = self.optimizer.state_dict()
+        else:
+            opt_state = None
         return (
             self.active_sh_degree,
             self._xyz,
@@ -77,7 +93,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
-            self.optimizer.state_dict(),
+            opt_state,
             self.spatial_lr_scale,
         )
     
@@ -94,10 +110,40 @@ class GaussianModel:
         denom,
         opt_dict, 
         self.spatial_lr_scale) = model_args
+        self._sync_splats()
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        if isinstance(opt_dict, dict) and all(isinstance(v, dict) for v in opt_dict.values()):
+            for name, state in opt_dict.items():
+                if name in self.optimizers:
+                    self.optimizers[name].load_state_dict(state)
+        elif isinstance(opt_dict, dict) and "param_groups" in opt_dict:
+            # Backward compatibility: old single-optimizer checkpoints.
+            param_groups = [
+                {"params": [self._xyz], "lr": 0.0},
+                {"params": [self._features_dc], "lr": 0.0},
+                {"params": [self._features_rest], "lr": 0.0},
+                {"params": [self._opacity], "lr": 0.0},
+                {"params": [self._scaling], "lr": 0.0},
+                {"params": [self._rotation], "lr": 0.0},
+            ]
+            tmp_optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+            try:
+                tmp_optimizer.load_state_dict(opt_dict)
+                param_map = {
+                    "means": self._xyz,
+                    "sh0": self._features_dc,
+                    "shN": self._features_rest,
+                    "opacities": self._opacity,
+                    "scales": self._scaling,
+                    "quats": self._rotation,
+                }
+                for name, param in param_map.items():
+                    if name in self.optimizers and param in tmp_optimizer.state:
+                        self.optimizers[name].state[param] = tmp_optimizer.state[param]
+            except Exception:
+                pass
 
     @property
     def get_scaling(self):
@@ -169,6 +215,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._sync_splats()
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
@@ -179,24 +226,25 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        use_sparse_adam = self.optimizer_type == "sparse_adam"
 
-        l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
-        ]
+        def make_optimizer(param, lr, use_sparse=False):
+            if use_sparse:
+                return torch.optim.SparseAdam([{"params": [param], "lr": lr}], eps=1e-15)
+            return torch.optim.Adam([{"params": [param], "lr": lr}], eps=1e-15)
 
-        if self.optimizer_type == "default":
-            self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        elif self.optimizer_type == "sparse_adam":
-            try:
-                self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
-            except:
-                # A special version of the rasterizer is required to enable sparse adam
-                self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        self.optimizers = {
+            "means": make_optimizer(
+                self._xyz,
+                training_args.position_lr_init * self.spatial_lr_scale,
+                use_sparse=use_sparse_adam,
+            ),
+            "sh0": make_optimizer(self._features_dc, training_args.feature_lr),
+            "shN": make_optimizer(self._features_rest, training_args.feature_lr / 20.0),
+            "opacities": make_optimizer(self._opacity, training_args.opacity_lr),
+            "scales": make_optimizer(self._scaling, training_args.scaling_lr, use_sparse=use_sparse_adam),
+            "quats": make_optimizer(self._rotation, training_args.rotation_lr, use_sparse=use_sparse_adam),
+        }
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
@@ -210,17 +258,31 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+        self.strategy = DefaultStrategy(
+            prune_opa=0.005,
+            grow_grad2d=training_args.densify_grad_threshold,
+            grow_scale3d=training_args.percent_dense,
+            prune_scale3d=0.1,
+            refine_start_iter=training_args.densify_from_iter,
+            refine_stop_iter=training_args.densify_until_iter,
+            refine_every=training_args.densification_interval,
+            reset_every=training_args.opacity_reset_interval,
+        )
+        self.strategy.check_sanity(self.splats, self.optimizers)
+        self.strategy_state = self.strategy.initialize_state(
+            scene_scale=self.spatial_lr_scale
+        )
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
 
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
+        lr = self.xyz_scheduler_args(iteration)
+        for param_group in self.optimizers["means"].param_groups:
+            param_group["lr"] = lr
+        return lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -310,6 +372,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._sync_splats()
 
         self.active_sh_degree = self.max_sh_degree
 
