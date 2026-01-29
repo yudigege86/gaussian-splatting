@@ -46,7 +46,7 @@ def render(
         dtype=torch.float32,
     )
 
-    viewmat = viewpoint_camera.world_view_transform.to(pc.get_xyz.device)
+    viewmat = viewpoint_camera.world_view_transform.transpose(0, 1).to(pc.get_xyz.device)
 
     means3D = pc.get_xyz
     opacity = pc.get_opacity.squeeze(-1)

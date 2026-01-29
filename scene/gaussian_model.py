@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -74,6 +75,16 @@ class GaussianModel:
                 "opacities": self._opacity,
             }
         )
+
+    def _sync_from_splats(self):
+        if not hasattr(self, "splats"):
+            return
+        self._xyz = self.splats["means"]
+        self._features_dc = self.splats["sh0"]
+        self._features_rest = self.splats["shN"]
+        self._scaling = self.splats["scales"]
+        self._rotation = self.splats["quats"]
+        self._opacity = self.splats["opacities"]
 
     def capture(self):
         if self.optimizers:

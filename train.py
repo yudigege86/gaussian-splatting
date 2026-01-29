@@ -170,6 +170,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 render_info,
                 packed=use_sparse_adam,
             )
+            gaussians._sync_from_splats()
 
         iter_end.record()
 
