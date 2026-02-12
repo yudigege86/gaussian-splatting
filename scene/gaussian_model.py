@@ -11,6 +11,7 @@
 
 import os
 import torch
+import torch.distributed as dist
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
@@ -43,10 +44,12 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", world_rank: int = 0, world_size: int = 1):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
+        self.world_rank = world_rank
+        self.world_size = world_size
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -220,6 +223,16 @@ class GaussianModel:
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        if self.world_size > 1:
+            sel = torch.arange(fused_point_cloud.shape[0], device=fused_point_cloud.device)[
+                self.world_rank::self.world_size
+            ]
+            fused_point_cloud = fused_point_cloud[sel]
+            features = features[sel]
+            scales = scales[sel]
+            rots = rots[sel]
+            opacities = opacities[sel]
+
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -311,14 +324,44 @@ class GaussianModel:
 
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
+        xyz = self._xyz
+        f_dc = self._features_dc
+        f_rest = self._features_rest
+        opacities = self._opacity
+        scale = self._scaling
+        rotation = self._rotation
 
-        xyz = self._xyz.detach().cpu().numpy()
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            xyz = self._gather_tensor(xyz)
+            f_dc = self._gather_tensor(f_dc)
+            f_rest = self._gather_tensor(f_rest)
+            opacities = self._gather_tensor(opacities)
+            scale = self._gather_tensor(scale)
+            rotation = self._gather_tensor(rotation)
+            if dist.get_rank() != 0:
+                return
+
+        xyz = xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        f_dc = (
+            f_dc.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        f_rest = (
+            f_rest.detach()
+            .transpose(1, 2)
+            .flatten(start_dim=1)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        opacities = opacities.detach().cpu().numpy()
+        scale = scale.detach().cpu().numpy()
+        rotation = rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -332,6 +375,32 @@ class GaussianModel:
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+
+    def _gather_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not (dist.is_available() and dist.is_initialized()):
+            return tensor
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return tensor
+        device = tensor.device
+        local_n = torch.tensor([tensor.shape[0]], device=device, dtype=torch.int64)
+        sizes = [torch.zeros_like(local_n) for _ in range(world_size)]
+        dist.all_gather(sizes, local_n)
+        sizes = [int(s.item()) for s in sizes]
+        max_n = max(sizes)
+        if tensor.shape[0] < max_n:
+            pad = torch.zeros(
+                (max_n - tensor.shape[0], *tensor.shape[1:]),
+                device=device,
+                dtype=tensor.dtype,
+            )
+            padded = torch.cat([tensor, pad], dim=0)
+        else:
+            padded = tensor
+        gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+        dist.all_gather(gathered, padded)
+        sliced = [gathered[i][: sizes[i]] for i in range(world_size)]
+        return torch.cat(sliced, dim=0)
 
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
@@ -377,12 +446,30 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        xyz = torch.tensor(xyz, dtype=torch.float, device="cuda")
+        features_dc = torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
+        features_extra = torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous()
+        opacities = torch.tensor(opacities, dtype=torch.float, device="cuda")
+        scales = torch.tensor(scales, dtype=torch.float, device="cuda")
+        rots = torch.tensor(rots, dtype=torch.float, device="cuda")
+
+        if self.world_size > 1:
+            sel = torch.arange(xyz.shape[0], device=xyz.device)[
+                self.world_rank::self.world_size
+            ]
+            xyz = xyz[sel]
+            features_dc = features_dc[sel]
+            features_extra = features_extra[sel]
+            opacities = opacities[sel]
+            scales = scales[sel]
+            rots = rots[sel]
+
+        self._xyz = nn.Parameter(xyz.requires_grad_(True))
+        self._features_dc = nn.Parameter(features_dc.requires_grad_(True))
+        self._features_rest = nn.Parameter(features_extra.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._sync_splats()
 
         self.active_sh_degree = self.max_sh_degree

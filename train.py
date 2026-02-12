@@ -10,7 +10,10 @@
 #
 
 import os
+import random
 import torch
+import torch.distributed as dist
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -34,13 +37,119 @@ try:
 except:
     FUSED_SSIM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def init_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        world_rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://")
+        return True, world_rank, world_size, local_rank
+    return False, 0, 1, 0
+
+
+def seed_all(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def maybe_sync_model_path(args, is_distributed: bool, world_rank: int):
+    if not is_distributed or args.model_path:
+        return
+    if world_rank == 0:
+        model_path = os.path.join("./output/", str(uuid.uuid4())[0:10])
+    else:
+        model_path = ""
+    obj_list = [model_path]
+    dist.broadcast_object_list(obj_list, src=0)
+    args.model_path = obj_list[0]
+
+
+def _gather_tensor(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    if world_size == 1:
+        return tensor
+    device = tensor.device
+    local_n = torch.tensor([tensor.shape[0]], device=device, dtype=torch.int64)
+    sizes = [torch.zeros_like(local_n) for _ in range(world_size)]
+    dist.all_gather(sizes, local_n)
+    sizes = [int(s.item()) for s in sizes]
+    max_n = max(sizes)
+    if tensor.shape[0] < max_n:
+        pad = torch.zeros(
+            (max_n - tensor.shape[0], *tensor.shape[1:]),
+            device=device,
+            dtype=tensor.dtype,
+        )
+        padded = torch.cat([tensor, pad], dim=0)
+    else:
+        padded = tensor
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+    sliced = [gathered[i][: sizes[i]] for i in range(world_size)]
+    return torch.cat(sliced, dim=0)
+
+
+def save_checkpoint_ddp(gaussians, iteration: int, model_path: str, world_rank: int, world_size: int):
+    if world_size == 1:
+        torch.save((gaussians.capture(), iteration), f"{model_path}/chkpnt{iteration}.pth")
+        return
+
+    xyz = _gather_tensor(gaussians._xyz, world_size)
+    features_dc = _gather_tensor(gaussians._features_dc, world_size)
+    features_rest = _gather_tensor(gaussians._features_rest, world_size)
+    scaling = _gather_tensor(gaussians._scaling, world_size)
+    rotation = _gather_tensor(gaussians._rotation, world_size)
+    opacity = _gather_tensor(gaussians._opacity, world_size)
+    max_radii2d = _gather_tensor(gaussians.max_radii2D, world_size)
+    xyz_grad_accum = _gather_tensor(gaussians.xyz_gradient_accum, world_size)
+    denom = _gather_tensor(gaussians.denom, world_size)
+
+    if world_rank == 0:
+        model_params = (
+            gaussians.active_sh_degree,
+            xyz,
+            features_dc,
+            features_rest,
+            scaling,
+            rotation,
+            opacity,
+            max_radii2d,
+            xyz_grad_accum,
+            denom,
+            None,
+            gaussians.spatial_lr_scale,
+        )
+        torch.save((model_params, iteration), f"{model_path}/chkpnt{iteration}.pth")
+
+
+def training(
+    dataset,
+    opt,
+    pipe,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    debug_from,
+    world_rank: int = 0,
+    world_size: int = 1,
+    distributed: bool = False,
+):
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    if distributed:
+        # Keep camera shuffling consistent across ranks.
+        seed_all(0)
+    tb_writer = prepare_output_and_logger(dataset) if world_rank == 0 else None
+    gaussians = GaussianModel(
+        dataset.sh_degree, opt.optimizer_type, world_rank=world_rank, world_size=world_size
+    )
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    # Reseed per rank for training-time randomness.
+    seed_all(1 + world_rank)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -59,33 +168,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    progress_bar = (
+        tqdm(range(first_iter, opt.iterations), desc="Training progress")
+        if world_rank == 0
+        else range(first_iter, opt.iterations)
+    )
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(
-                        custom_cam,
-                        gaussians,
-                        pipe,
-                        background,
-                        scaling_modifier=scaling_modifer,
-                        use_trained_exp=dataset.train_test_exp,
-                        separate_sh=False,
-                        packed=use_sparse_adam,
-                        sparse_grad=use_sparse_adam,
-                    )["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+        if world_rank == 0:
+            if network_gui.conn == None:
+                network_gui.try_connect()
+            while network_gui.conn != None:
+                try:
+                    net_image_bytes = None
+                    custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                    if custom_cam != None:
+                        net_image = render(
+                            custom_cam,
+                            gaussians,
+                            pipe,
+                            background,
+                            scaling_modifier=scaling_modifer,
+                            use_trained_exp=dataset.train_test_exp,
+                            separate_sh=False,
+                            packed=use_sparse_adam,
+                            sparse_grad=use_sparse_adam,
+                            distributed=False,
+                        )["render"]
+                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                    network_gui.send(net_image_bytes, dataset.source_path)
+                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                        break
+                except Exception as e:
+                    network_gui.conn = None
 
         iter_start.record()
 
@@ -118,6 +233,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             separate_sh=False,
             packed=use_sparse_adam,
             sparse_grad=use_sparse_adam,
+            distributed=distributed,
         )
         image = render_pkg["render"]
         render_info = render_pkg["info"]
@@ -179,11 +295,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
+            if world_rank == 0:
+                if iteration % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                    progress_bar.update(10)
+                if iteration == opt.iterations:
+                    progress_bar.close()
 
             # Log and save
             training_report(
@@ -191,16 +308,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 iteration,
                 Ll1,
                 loss,
+                Ll1depth,
                 l1_loss,
                 iter_start.elapsed_time(iter_end),
                 testing_iterations,
                 scene,
                 render,
-                (pipe, background, 1.0, False, None, dataset.train_test_exp, use_sparse_adam, use_sparse_adam),
+                (pipe, background, 1.0, False, None, dataset.train_test_exp, use_sparse_adam, use_sparse_adam, distributed),
                 dataset.train_test_exp,
+                world_rank=world_rank,
+                world_size=world_size,
+                distributed=distributed,
             )
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+            if iteration in saving_iterations:
+                if world_rank == 0:
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Optimizer step
@@ -212,8 +334,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     optimizer.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if world_rank == 0:
+                    print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                save_checkpoint_ddp(
+                    gaussians,
+                    iteration,
+                    scene.model_path,
+                    world_rank=world_rank,
+                    world_size=world_size,
+                )
+
+    if gaussians.strategy is not None and hasattr(gaussians.strategy, "split_call_count"):
+        print(f"\nSplit called {gaussians.strategy.split_call_count} times.")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -237,14 +369,17 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
+def training_report(tb_writer, iteration, Ll1, loss, Ll1depth, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, world_rank: int = 0, world_size: int = 1, distributed: bool = False):
+    if tb_writer and world_rank == 0:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/depth_loss', Ll1depth, iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
+        if distributed:
+            dist.barrier()
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
@@ -267,15 +402,18 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
+                if world_rank == 0:
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if tb_writer and world_rank == 0:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
-        if tb_writer:
+        if tb_writer and world_rank == 0:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
+        if distributed:
+            dist.barrier()
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -291,7 +429,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -301,11 +439,31 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
+    is_distributed, world_rank, world_size, local_rank = init_distributed()
+    if is_distributed:
+        # safe_state pins cuda:0; reset to local rank device
+        torch.cuda.set_device(local_rank)
+        if world_rank != 0:
+            args.disable_viewer = True
+        maybe_sync_model_path(args, is_distributed, world_rank)
+
     # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+        world_rank=world_rank,
+        world_size=world_size,
+        distributed=is_distributed,
+    )
 
     # All done
     print("\nTraining complete.")

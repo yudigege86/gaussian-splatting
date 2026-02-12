@@ -26,6 +26,7 @@ def render(
     use_trained_exp=False,
     packed=False,
     sparse_grad=False,
+    distributed: bool = False,
 ):
     """
     Render the scene. 
@@ -95,6 +96,7 @@ def render(
         rasterize_mode=rasterize_mode,
         render_mode=render_mode,
         backgrounds=bg_color[None],
+        distributed=distributed,
     )
 
     info["width"] = width
